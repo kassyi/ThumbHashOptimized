@@ -12,13 +12,13 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "kassyi",
+  "license": "MIT License",
   "devDependencies": {
     "@types/ejs": "^3.1.5",
     "ejs": "^5.0.1",
     "html-webpack-plugin": "^5.6.6",
-    "ts-loader": "^9.5.4",
+    "ts-loader": "^9.5.7",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",
     "webpack": "^5.105.4",
