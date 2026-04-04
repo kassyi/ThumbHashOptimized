@@ -14,8 +14,8 @@ export interface ThumbHashImage {
 }
 
 export interface IThumbHashStrategy {
-  readonly encodeProfiler: IProfiler;
-  readonly decodeProfiler: IProfiler;
+  readonly encodeProfiler?: IProfiler;
+  readonly decodeProfiler?: IProfiler;
 
   /**
  * Encode an RGBA image into a ThumbHash.

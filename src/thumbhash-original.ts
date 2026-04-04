@@ -20,8 +20,8 @@ const { PI, round, max, min, cos, abs } = Math;
  * JavaScript reference implementation, so that benchmark comparisons are fair.
  */
 export class ThumbHashOriginal implements IThumbHashStrategy {
-  public readonly encodeProfiler: IProfiler;
-  public readonly decodeProfiler: IProfiler;
+  public readonly encodeProfiler?: IProfiler;
+  public readonly decodeProfiler?: IProfiler;
 
   /**
    * Initialise single-stage profilers for encode and decode.
@@ -31,12 +31,14 @@ export class ThumbHashOriginal implements IThumbHashStrategy {
    * easy to compare total throughput in the benchmark UI.
    */
   constructor() {
-    this.encodeProfiler = new Profiler({
-      process: { label: "Legacy Encode Process", color: "bg-gray-500" },
-    });
-    this.decodeProfiler = new Profiler({
-      process: { label: "Legacy Decode Process", color: "bg-gray-400" },
-    });
+    if (__PROFILE__) {
+      this.encodeProfiler = new Profiler({
+        process: { label: "Legacy Encode Process", color: "bg-gray-500" },
+      });
+      this.decodeProfiler = new Profiler({
+        process: { label: "Legacy Decode Process", color: "bg-gray-400" },
+      });
+    }
   }
 
   /**
@@ -52,7 +54,7 @@ export class ThumbHashOriginal implements IThumbHashStrategy {
    * compact byte array. Alpha is supported but increases the hash size slightly.
    */
   rgbaToThumbHash(w: number, h: number, rgba: Uint8Array | Uint8ClampedArray): Uint8Array {
-    this.encodeProfiler.start();
+    if (__PROFILE__) this.encodeProfiler!.start();
     let avg_r = 0,
       avg_g = 0,
       avg_b = 0,
@@ -154,7 +156,7 @@ export class ThumbHashOriginal implements IThumbHashStrategy {
     for (let ac of hasAlpha ? [l_ac, p_ac, q_ac, a_ac] : [l_ac, p_ac, q_ac])
       for (let f of ac) hash[ac_start + (ac_index >> 1)] |= round(15 * f) << ((ac_index++ & 1) << 2);
     const result = new Uint8Array(hash);
-    this.encodeProfiler.record("process");
+    if (__PROFILE__) this.encodeProfiler!.record("process");
     return result;
   }
 
@@ -170,7 +172,7 @@ export class ThumbHashOriginal implements IThumbHashStrategy {
    * ratio-preserving variant thereof.
    */
   thumbHashToRGBA(hash: Uint8Array): ThumbHashImage {
-    this.decodeProfiler.start();
+    if (__PROFILE__) this.decodeProfiler!.start();
     let header24 = hash[0] | (hash[1] << 8) | (hash[2] << 16);
     let header16 = hash[3] | (hash[4] << 8);
     let l_dc = (header24 & 63) / 63,
@@ -249,7 +251,7 @@ export class ThumbHashOriginal implements IThumbHashStrategy {
       }
     }
     const result = { w, h, rgba };
-    this.decodeProfiler.record("process");
+    if (__PROFILE__) this.decodeProfiler!.record("process");
     return result;
   }
 }
