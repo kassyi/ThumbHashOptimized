@@ -1,61 +1,79 @@
-# ThumbHash Full-Stack Optimization Benchmark
+# ThumbHash Optimized Implementation
 
 <img src="https://img.shields.io/badge/TypeScript-optimized-blue?style=flat-square" alt="TypeScript">
-<img src="https://img.shields.io/badge/encode-6.62x%20faster-brightgreen?labelColor=2f3232&style=flat-square" alt="encode speed">
-<img src="https://img.shields.io/badge/decode-13.75x%20faster-brightgreen?labelColor=2f3232&style=flat-square" alt="decode speed">
+<img src="https://img.shields.io/badge/encode-6.3x%20faster-brightgreen?labelColor=2f3232&style=flat-square" alt="encode speed">
+<img src="https://img.shields.io/badge/decode-13.6x%20faster-brightgreen?labelColor=2f3232&style=flat-square" alt="decode speed">
 
-ThumbHash の TypeScript 実装における低レイヤー最適化のベンチマーク・プロジェクトです。
-アルゴリズムの数学的性質（DCT の対称性など）やブラウザの実行効率（Channel Fission, SWAR）を極限まで追求し、オリジナル実装に対して大幅な高速化を実現しています。
+This project is a high-performance benchmark project comparing the original ThumbHash implementation with a fully optimized version in TypeScript.
+It leverages mathematical properties of algorithms (such as DCT symmetry) and browser execution efficiency (Channel Fission, SWAR, Loop Unrolling) to achieve massive speed boosts.
 
 ## Performance Highlights
 
-AMD Ryzen 9 7900X 環境での計測結果：
+Measured on AMD Ryzen 9 7900X:
 
-| Task         | Original | Optimized   | Speedup    |
-| :----------- | :------- | :---------- | :--------- |
-| **Encode※1** | 402.5 ms | **63.6 ms** | **~6.33x** |
-| **Decode※2** | 108.8 ms | **8.0 ms**  | **~13.6x** |
+| Task          | Original | Optimized   | Speedup    |
+| :------------ | :------- | :---------- | :--------- |
+| **Encode**[1] | 402.5 ms | **63.6 ms** | **~6.3x**  |
+| **Decode**[2] | 108.8 ms | **8.0 ms**  | **~13.6x** |
 
-- ※1 1000回イテレーションの合計値。
-- ※2 5000回イテレーションの合計値。
+- [1] Total time for 1,000 iterations.
+- [2] Total time for 5,000 iterations.
 
-実行環境：Chrome 146 / Windows 11
+_Environment: Chrome 146 / Windows 11_
 
 ## Optimization Techniques
 
-本プロジェクトでは、以下の 7 つの主要な最適化手法を導入しています。
+The project implements seven key optimization strategies:
 
-1.  **Symmetric DCT Folding**: DCT の対称性を利用し、計算量を削減。
-2.  **Channel Fission**: CPU のパイプライン効率とメモリレイアウトを最適化。
-3.  **SWAR (SIMD Within A Register)**: 単一のレジスタ内で複数のデータを並列処理。
-4.  **Lookup Table Strategy**: 計算コストの高い関数の結果を事前計算。
-5.  **Hot-path Inlining**: JIT コンパイラの最適化を加速させるためのインライン展開。
-6.  **Loop Unrolling & Vectorization Friendly Code**: ブラウザの自動ベクトル化を促すコーディング。
-7.  **Memory Access Optimization**: 不要なアロケーションを削減し、キャッシュ効率を向上。
+1.  **Symmetric DCT Folding**: Reduces computational complexity by exploiting DCT symmetry.
+2.  **Channel Fission**: Optimizes CPU pipeline efficiency and memory layout by processing color channels independently.
+3.  **SWAR (SIMD Within A Register)**: Performs parallel data processing within a single register (e.g., handling multiple color channels in one operation).
+4.  **Lookup Table Strategy**: Precomputes results for computationally expensive functions to avoid runtime overhead.
+5.  **Hot-path Inlining**: Forces critical path inlining to assist JIT compiler optimizations.
+6.  **Loop Unrolling & Vectorization**: Aggressive loop unrolling via a code generation pipeline to encourage browser auto-vectorization.
+7.  **Memory Access Optimization**: Minimizes allocations and improves cache efficiency through typed arrays and linear access patterns.
+
+## Generation Pipeline (EJS + TypeScript Templates)
+
+To achieve maximum performance (particularly for loop unrolling and pre-computed blocks), this project uses a specialized code generation pipeline.
+
+- **Model-View-Template Pattern**: Complex loop unrolling and mathematical logic are extracted into **TypeScript Generators** (`scripts/generators/`).
+- **EJS Templates**: The structural algorithm logic and boilerplate are defined in `src/templates/thumbhash-optimized.ts.ejs`.
+- **Pre-build Automation**: The `npm run generate` command (running automatically before `npm run build`) injects generated code blocks into the EJS template to produce the high-performance implementation in `src/generated/thumbhash-optimized.ts`.
+
+This architecture allows the source code to remain maintainable while the final artifact is a highly-tuned, hard-coded implementation that maximizes throughput.
 
 ## Project Structure
 
 ```text
 src/
-├── thumbhash-original.ts   # ベースラインとなるオリジナル実装
-├── thumbhash-optimized.ts  # 極限まで最適化された実装
-├── thumbhash-strategy.ts   # 共通インターフェース
-├── profiler.ts             # ステップごとの実行時間計測ツール
-├── index.ts                # エントリポイント
-└── bench-ui.ts             # ベンチマーク結果の描画ロジック
-bench.html                  # インタラクティブなベンチマーク UI
+├── templates/          # EJS templates for code generation
+├── generated/          # Auto-generated optimized implementation
+├── thumbhash-original.ts # Baseline original implementation
+├── thumbhash-strategy.ts # Common interface for benchmarking
+├── profiler.ts          # Execution time measurement for specific stages
+├── index.ts             # Application entry point
+└── bench-ui.ts          # Benchmark UI and orchestration logic
+scripts/
+├── generators/         # Domain-specific code generation logic (TypeScript)
+└── generate-thumbhash.ts # Pipeline runner script
+bench.html               # Interactive benchmark UI
 ```
 
 ## Setup & Run
 
-### 開発環境の起動
+### Development
+
+Start the development server with Hot Module Replacement (HMR):
 
 ```bash
 npm install
 npm run dev
 ```
 
-### ビルド
+### Build
+
+Build the production bundle. This command automatically triggers the code generation pipeline via `prebuild`.
 
 ```bash
 npm run build
