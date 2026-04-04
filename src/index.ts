@@ -6,6 +6,7 @@
  * element IDs referenced inside {@link BenchUI} exist before the constructor
  * tries to query them.
  */
+
 import { BenchUI } from "./bench-ui";
 
 // Wait for the DOM to be ready before instantiating BenchUI, because the

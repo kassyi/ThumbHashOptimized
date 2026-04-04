@@ -9,7 +9,7 @@
  * coupled DOM manipulation across multiple modules.
  */
 import { ThumbHashOriginal } from "./thumbhash-original";
-import { ThumbHashOptimized } from "./thumbhash-optimized";
+import { ThumbHashOptimized } from "./generated/thumbhash-optimized";
 import { IThumbHashStrategy } from "./thumbhash-strategy";
 import { IProfiler } from "./profiler";
 
@@ -215,8 +215,8 @@ export class BenchUI {
     
     // Reset profilers
     [this.originalStrategy, this.optimizedStrategy].forEach(s => {
-      s.encodeProfiler.reset();
-      s.decodeProfiler.reset();
+      s.encodeProfiler?.reset();
+      s.decodeProfiler?.reset();
     });
 
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
@@ -232,8 +232,8 @@ export class BenchUI {
     }
 
     [this.originalStrategy, this.optimizedStrategy].forEach(s => {
-      s.encodeProfiler.reset();
-      s.decodeProfiler.reset();
+      s.encodeProfiler?.reset();
+      s.decodeProfiler?.reset();
     });
 
     // 1. Original Encode
@@ -278,12 +278,11 @@ export class BenchUI {
     this.decodeSpeedupBadge.classList.remove("hidden");
 
     // Store profiler data for UI
-    this.currentProfilerData = {
-      "orig-enc": this.originalStrategy.encodeProfiler,
-      "orig-dec": this.originalStrategy.decodeProfiler,
-      "opt-enc": this.optimizedStrategy.encodeProfiler,
-      "opt-dec": this.optimizedStrategy.decodeProfiler,
-    };
+    this.currentProfilerData = {};
+    if (this.originalStrategy.encodeProfiler) this.currentProfilerData["orig-enc"] = this.originalStrategy.encodeProfiler;
+    if (this.originalStrategy.decodeProfiler) this.currentProfilerData["orig-dec"] = this.originalStrategy.decodeProfiler;
+    if (this.optimizedStrategy.encodeProfiler) this.currentProfilerData["opt-enc"] = this.optimizedStrategy.encodeProfiler;
+    if (this.optimizedStrategy.decodeProfiler) this.currentProfilerData["opt-dec"] = this.optimizedStrategy.decodeProfiler;
 
     // Prepare JSON export
     const exportData = {

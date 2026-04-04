@@ -16,31 +16,65 @@ const { PI, round, max, cos } = Math;
 
 const INV_255 = 1.0 / 255.0;
 const INV_3 = 1.0 / 3.0;
+const RGBA_CHANNELS = 4;
+
+// Algorithm Specifications:
+const MAX_L_FREQ = 7;
+const MAX_CHROMA_FREQ = 3;
+const MAX_ALPHA_FREQ = 5;
+const MAX_IMG_DIM = 100;
+const MAX_DECODE_DIM = 32;
+
+// Header Specification (Packing Ranges):
+const L_DC_MAX = 63.0;
+const PQ_DC_CENTER = 31.5;
+const L_SCALE_MAX = 31.0;
+const PQ_SCALE_MAX = 63.0;
+const ALPHA_MAX = 15.0;
+const AC_INPUT_NORM = 1.0 / 7.5;
+
+// Header Bit Offsets (H24 & H16):
+const H24_L_DC = 0;
+const H24_P_DC = 6;
+const H24_Q_DC = 12;
+const H24_L_SCALE = 18;
+const H24_HAS_ALPHA = 23;
+
+const H16_FREQ_COUNT = 0;
+const H16_P_SCALE = 3;
+const H16_Q_SCALE = 9;
+const H16_IS_LANDSCAPE = 15;
 
 // Optimization (6) – Pre-Scaled Arithmetic (Semantic Constants):
-// Magic numbers like `0.001307...` are named so that V8 can constant-fold them
-// at compile time. The encoder normalises raw pixel sums in a single multiply
-// at the end of each row, rather than dividing inside the pixel loop.
 const ENC_L_NORM = INV_255 * INV_3;
 const ENC_P_NORM = INV_255 * 0.5;
 const ENC_Q_NORM = INV_255;
 
 // Optimization (6) – Pre-Scaled Arithmetic (Decoder pre-baking):
-// All channel-to-RGB conversion factors (÷3, ÷2, ×255, ×1.25) are folded into
-// these module-level constants at load time. The innermost decode loop therefore
-// reduces to pure additions and subtractions — zero multiplications per pixel.
-const DEC_L_DC_PRESCALE = 255.0 / 63.0;
-const DEC_PQ_DC_NORM = 1.0 / 31.5;
-const DEC_L_AC_PRESCALE = 255.0 / 31.0;
+const DEC_L_DC_PRESCALE = 255.0 / L_DC_MAX;
+const DEC_PQ_DC_NORM = 1.0 / PQ_DC_CENTER;
+const DEC_L_AC_PRESCALE = 255.0 / L_SCALE_MAX;
 const DEC_PQ_BASE_VAL = 255.0 / 3.0;
 const DEC_Q_BASE_VAL = 255.0 / 2.0;
 const DEC_PQ_AC_BOOST = 1.25;
-const DEC_PQ_AC_NORM = 1.0 / 63.0;
-const DEC_A_PRESCALE = 255.0 / 15.0;
-const DEC_AC_INPUT_NORM = 1.0 / 7.5;
+const DEC_PQ_AC_NORM = 1.0 / PQ_SCALE_MAX;
+const DEC_A_PRESCALE = 255.0 / ALPHA_MAX;
+const DEC_AC_INPUT_NORM = AC_INPUT_NORM;
 
-// Combined prescale constants fold three multiplications (norm × boost × base)
-// into one value so the decoder header-unpacking loop does a single multiply.
+// Optimization (2) – Vectorized Fetch LUT Layout:
+const LUT_ENTRIES = 256;
+const LUT_ENTRY_SIZE = 8;
+const LUT_IDX_ALPHA = 0;     // [+0] raw alpha in [0,1]
+const LUT_IDX_WEIGHT = 1;    // [+1] alpha × INV_255 (for R,G,B weighting)
+const LUT_IDX_BG_L = 4;      // [+4] background L contribution
+const LUT_IDX_BG_P = 5;      // [+5] background P contribution
+const LUT_IDX_BG_Q = 6;      // [+6] background Q contribution
+
+// Optimization (2) – SWAR (SIMD Within A Register) Hacks:
+const SIMD_ALPHA_SHIFT = 24 - 3; // Bit 24-31 (Alpha) → Bit 3-10 (Index * 8)
+const SIMD_ALPHA_MASK = 0xFF << 3;
+
+// Combined prescale constants:
 const DEC_P_AC_PRESCALE = DEC_PQ_AC_NORM * DEC_PQ_AC_BOOST * DEC_PQ_BASE_VAL;
 const DEC_Q_AC_PRESCALE = DEC_PQ_AC_NORM * DEC_PQ_AC_BOOST * DEC_Q_BASE_VAL;
 
@@ -55,15 +89,13 @@ const DEC_Q_AC_PRESCALE = DEC_PQ_AC_NORM * DEC_PQ_AC_BOOST * DEC_Q_BASE_VAL;
 // Float64Array is mandatory. If Float32Array were used, V8 would emit
 // cvtss2sd / cvtsd2ss conversion instructions on every read/write, stalling
 // the execution pipeline. Float64 is the engine's native numeric type.
-const packedLUT = new Float64Array(256 * 8);
-for (let i = 0; i < 256; i++) {
+const packedLUT = new Float64Array(LUT_ENTRIES * LUT_ENTRY_SIZE);
+for (let i = 0; i < LUT_ENTRIES; i++) {
   const a = i * INV_255;
   const am = a * INV_255;  // alpha² = alpha/255 (premultiplied per-channel weight)
-  const offset = i << 3;  // 8 slots per entry; multiply index by 8 via left-shift
-  packedLUT[offset] = a;           // [+0] raw alpha in [0,1]
-  packedLUT[offset + 1] = am;      // [+1] alpha × INV_255  (for R,G,B weighting)
-  packedLUT[offset + 2] = am * INV_3;  // [+2] unused placeholder (kept for alignment)
-  packedLUT[offset + 3] = am * 0.5;   // [+3] unused placeholder
+  const offset = i * LUT_ENTRY_SIZE;
+  packedLUT[offset + LUT_IDX_ALPHA] = a;
+  packedLUT[offset + LUT_IDX_WEIGHT] = am;
 }
 
 // Optimization (5) – Type Stability + Optimization (7) – Zero-Allocation:
@@ -71,19 +103,19 @@ for (let i = 0; i < 256; i++) {
 // Reusing the same memory across calls eliminates GC pressure entirely.
 // Float64Array is chosen over Float32Array to avoid implicit type-conversion
 // stalls inside V8 (see packedLUT comment above).
-const fxTable = new Float64Array(7 * 100),  // horizontal cosine LUT (encoder)
-  fyTable = new Float64Array(7 * 100);        // vertical cosine LUT   (encoder)
-const rowSumsL = new Float64Array(7 * 100), // horizontal DCT partial sums – L channel
-  rowSumsP = new Float64Array(3 * 100),     // horizontal DCT partial sums – P channel
-  rowSumsQ = new Float64Array(3 * 100);     // horizontal DCT partial sums – Q channel
-const dFx = new Float64Array(7 * 32),  // horizontal cosine LUT (decoder, max 7 freq × 32 px)
-  dFy = new Float64Array(7 * 32);       // vertical   cosine LUT (decoder)
-const tL = new Float64Array(7 * 1024), // horizontal IDCT output – L  (max 7 rows × 32 px)
-  tP = new Float64Array(3 * 1024),     // horizontal IDCT output – P
-  tQ = new Float64Array(3 * 1024);     // horizontal IDCT output – Q
-const dLAc = new Float64Array(32),  // unpacked L AC coefficients
-  dPAc = new Float64Array(9),       // unpacked P AC coefficients
-  dQAc = new Float64Array(9);       // unpacked Q AC coefficients
+const fxTable = new Float64Array(MAX_L_FREQ * MAX_IMG_DIM),  // horizontal cosine LUT (encoder)
+  fyTable = new Float64Array(MAX_L_FREQ * MAX_IMG_DIM);        // vertical cosine LUT   (encoder)
+const rowSumsL = new Float64Array(MAX_L_FREQ * MAX_IMG_DIM), // horizontal DCT partial sums – L channel
+  rowSumsP = new Float64Array(MAX_CHROMA_FREQ * MAX_IMG_DIM),     // horizontal DCT partial sums – P channel
+  rowSumsQ = new Float64Array(MAX_CHROMA_FREQ * MAX_IMG_DIM);     // horizontal DCT partial sums – Q channel
+const dFx = new Float64Array(MAX_L_FREQ * MAX_DECODE_DIM),  // horizontal cosine LUT (decoder)
+  dFy = new Float64Array(MAX_L_FREQ * MAX_DECODE_DIM);       // vertical   cosine LUT (decoder)
+const tL = new Float64Array(MAX_L_FREQ * MAX_DECODE_DIM * MAX_DECODE_DIM), // horizontal IDCT output – L
+  tP = new Float64Array(MAX_CHROMA_FREQ * MAX_DECODE_DIM * MAX_DECODE_DIM),     // horizontal IDCT output – P
+  tQ = new Float64Array(MAX_CHROMA_FREQ * MAX_DECODE_DIM * MAX_DECODE_DIM);     // horizontal IDCT output – Q
+const dLAc = new Float64Array(MAX_DECODE_DIM),  // unpacked L AC coefficients
+  dPAc = new Float64Array(MAX_CHROMA_FREQ * MAX_CHROMA_FREQ),       // unpacked P AC coefficients
+  dQAc = new Float64Array(MAX_CHROMA_FREQ * MAX_CHROMA_FREQ);       // unpacked Q AC coefficients
 
 // Optimization (7) – Primitive Memoization:
 // Cache the last image dimensions used to build the cosine LUTs. Comparing
@@ -108,8 +140,8 @@ let lastDW = 0,
  * Comments throughout the code explain the *why* behind each optimization.
  */
 export class ThumbHashOptimized implements IThumbHashStrategy {
-  public readonly encodeProfiler: IProfiler;
-  public readonly decodeProfiler: IProfiler;
+  public readonly encodeProfiler?: IProfiler;
+  public readonly decodeProfiler?: IProfiler;
 
   /**
    * Initialise profiling sections for both encode and decode pipelines.
@@ -118,23 +150,25 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
    * developers to pinpoint bottlenecks.
    */
   constructor() {
-    this.encodeProfiler = new Profiler({
-      setupAvg: { label: "1. Fast Opaque Scan & Avg", color: "bg-indigo-500" },
-      tables: { label: "2. Math.cos LUT Generation", color: "bg-blue-500" },
-      encodeHorizL: { label: "3. Fission DCT (Horiz L)", color: "bg-purple-500" },
-      encodeHorizPQ: { label: "4. Fission DCT (Horiz PQ)", color: "bg-fuchsia-500" },
-      encodeHorizA: { label: "5. Fission DCT (Horiz A)", color: "bg-pink-500" },
-      encodeVertL: { label: "6. Vert 1D DCT (L)", color: "bg-emerald-500" },
-      encodeVertPQ: { label: "7. Vert 1D DCT (Color)", color: "bg-teal-500" },
-      encodeVertA: { label: "8. Vert 1D DCT (Alpha)", color: "bg-cyan-500" },
-      packing: { label: "9. Bit Packing & Shift", color: "bg-gray-500" },
-    });
-    this.decodeProfiler = new Profiler({
-      header: { label: "1. Header Parsing", color: "bg-amber-500" },
-      tables: { label: "2. Math.cos LUT Generation", color: "bg-orange-500" },
-      idctHoriz: { label: "3. IDCT Horizontal", color: "bg-red-500" },
-      idctVert: { label: "4. IDCT Vertical", color: "bg-rose-500" },
-    });
+    if (__PROFILE__) {
+      this.encodeProfiler = new Profiler({
+        setupAvg: { label: "1. Fast Opaque Scan & Avg", color: "bg-indigo-500" },
+        tables: { label: "2. Math.cos LUT Generation", color: "bg-blue-500" },
+        encodeHorizL: { label: "3. Fission DCT (Horiz L)", color: "bg-purple-500" },
+        encodeHorizPQ: { label: "4. Fission DCT (Horiz PQ)", color: "bg-fuchsia-500" },
+        encodeHorizA: { label: "5. Fission DCT (Horiz A)", color: "bg-pink-500" },
+        encodeVertL: { label: "6. Vert 1D DCT (L)", color: "bg-emerald-500" },
+        encodeVertPQ: { label: "7. Vert 1D DCT (Color)", color: "bg-teal-500" },
+        encodeVertA: { label: "8. Vert 1D DCT (Alpha)", color: "bg-cyan-500" },
+        packing: { label: "9. Bit Packing & Shift", color: "bg-gray-500" },
+      });
+      this.decodeProfiler = new Profiler({
+        header: { label: "1. Header Parsing", color: "bg-amber-500" },
+        tables: { label: "2. Math.cos LUT Generation", color: "bg-orange-500" },
+        idctHoriz: { label: "3. IDCT Horizontal", color: "bg-red-500" },
+        idctVert: { label: "4. IDCT Vertical", color: "bg-rose-500" },
+      });
+    }
   }
 
   /**
@@ -152,13 +186,13 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
   rgbaToThumbHash(w: number, h: number, rgba: Uint8Array | Uint8ClampedArray): Uint8Array {
     const numPixels = w * h;
     let hasAlpha = false;
-    for (let i = 3, len = numPixels * 4; i < len; i += 4)
+    for (let i = 3, len = numPixels * RGBA_CHANNELS; i < len; i += RGBA_CHANNELS)
       if (rgba[i] < 255) {
         hasAlpha = true;
         break;
       }
 
-    this.encodeProfiler.start();
+    if (__PROFILE__) this.encodeProfiler!.start();
     let avg_r = 0,
       avg_g = 0,
       avg_b = 0,
@@ -182,7 +216,7 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
           sb += (p >> 16) & 0xff;
         }
       } else {
-        for (let i = 0; i < numPixels * 4; i += 4) {
+        for (let i = 0; i < numPixels * RGBA_CHANNELS; i += RGBA_CHANNELS) {
           sr += rgba[i];
           sg += rgba[i + 1];
           sb += rgba[i + 2];
@@ -230,40 +264,40 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
           // `p >>> 21` shifts the alpha byte (bits 24-31) right by 21, placing it
           // at bits 3-10. `& 0x7f8` then masks to bits 3-10 (= alpha * 8), which
           // is the byte offset for packedLUT — avoids a separate multiply by 8.
-          const o0 = (p0 >>> 21) & 0x7f8,
-            o1 = (p1 >>> 21) & 0x7f8,
-            o2 = (p2 >>> 21) & 0x7f8,
-            o3 = (p3 >>> 21) & 0x7f8;
-          const am0 = packedLUT[o0 + 1],
-            am1 = packedLUT[o1 + 1],
-            am2 = packedLUT[o2 + 1],
-            am3 = packedLUT[o3 + 1];
+          const o0 = (p0 >>> SIMD_ALPHA_SHIFT) & SIMD_ALPHA_MASK,
+            o1 = (p1 >>> SIMD_ALPHA_SHIFT) & SIMD_ALPHA_MASK,
+            o2 = (p2 >>> SIMD_ALPHA_SHIFT) & SIMD_ALPHA_MASK,
+            o3 = (p3 >>> SIMD_ALPHA_SHIFT) & SIMD_ALPHA_MASK;
+          const am0 = packedLUT[o0 + LUT_IDX_WEIGHT],
+            am1 = packedLUT[o1 + LUT_IDX_WEIGHT],
+            am2 = packedLUT[o2 + LUT_IDX_WEIGHT],
+            am3 = packedLUT[o3 + LUT_IDX_WEIGHT];
           ar0 += am0 * (p0 & 0xff);
           ag0 += am0 * ((p0 >> 8) & 0xff);
           ab0 += am0 * ((p0 >> 16) & 0xff);
-          aa0 += packedLUT[o0];
+          aa0 += packedLUT[o0 + LUT_IDX_ALPHA];
           ar1 += am1 * (p1 & 0xff);
           ag1 += am1 * ((p1 >> 8) & 0xff);
           ab1 += am1 * ((p1 >> 16) & 0xff);
-          aa1 += packedLUT[o1];
+          aa1 += packedLUT[o1 + LUT_IDX_ALPHA];
           ar2 += am2 * (p2 & 0xff);
           ag2 += am2 * ((p2 >> 8) & 0xff);
           ab2 += am2 * ((p2 >> 16) & 0xff);
-          aa2 += packedLUT[o2];
+          aa2 += packedLUT[o2 + LUT_IDX_ALPHA];
           ar3 += am3 * (p3 & 0xff);
           ag3 += am3 * ((p3 >> 8) & 0xff);
           ab3 += am3 * ((p3 >> 16) & 0xff);
-          aa3 += packedLUT[o3];
+          aa3 += packedLUT[o3 + LUT_IDX_ALPHA];
           idx += 4;
         }
         while (idx < numPixels) {
           const p = rgba32[idx++];
-          const o = (p >>> 21) & 0x7f8;
-          const am = packedLUT[o + 1];
+          const o = (p >>> SIMD_ALPHA_SHIFT) & SIMD_ALPHA_MASK;
+          const am = packedLUT[o + LUT_IDX_WEIGHT];
           ar0 += am * (p & 0xff);
           ag0 += am * ((p >> 8) & 0xff);
           ab0 += am * ((p >> 16) & 0xff);
-          aa0 += packedLUT[o];
+          aa0 += packedLUT[o + LUT_IDX_ALPHA];
         }
       }
       avg_r = ar0 + ar1 + ar2 + ar3;
@@ -289,22 +323,22 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
     // per-pixel DCT loop can add the background contribution with a single
     // LUT lookup rather than a multiply-and-subtract.
     if (hasAlpha) {
-      for (let i = 0; i < 256; i++) {
-        const o = i << 3;
-        const invA = 1.0 - packedLUT[o];  // (1 - alpha): background weight
-        packedLUT[o + 4] = avgL * invA;   // background L contribution for this alpha
-        packedLUT[o + 5] = avgP * invA;   // background P contribution
-        packedLUT[o + 6] = avgQ * invA;   // background Q contribution
+      for (let i = 0; i < LUT_ENTRIES; i++) {
+        const o = i * LUT_ENTRY_SIZE;
+        const invA = 1.0 - packedLUT[o + LUT_IDX_ALPHA];  // (1 - alpha): background weight
+        packedLUT[o + LUT_IDX_BG_L] = avgL * invA;   // background L contribution for this alpha
+        packedLUT[o + LUT_IDX_BG_P] = avgP * invA;   // background P contribution
+        packedLUT[o + LUT_IDX_BG_Q] = avgQ * invA;   // background Q contribution
       }
     }
-    const nx_l = max(1, round(((hasAlpha ? 5 : 7) * w) / max(w, h))),
-      ny_l = max(1, round(((hasAlpha ? 5 : 7) * h) / max(w, h)));
+    const nx_l = max(1, round(((hasAlpha ? MAX_ALPHA_FREQ : MAX_L_FREQ) * w) / max(w, h))),
+      ny_l = max(1, round(((hasAlpha ? MAX_ALPHA_FREQ : MAX_L_FREQ) * h) / max(w, h)));
 
-    this.encodeProfiler.record("setupAvg");
+    if (__PROFILE__) this.encodeProfiler!.record("setupAvg");
 
     if (w !== lastEW || h !== lastEH || nx_l !== lastENX || ny_l !== lastENY || hasAlpha !== lastEA) {
-      const mnx = max(nx_l, hasAlpha ? 5 : 3),
-        mny = max(ny_l, hasAlpha ? 5 : 3);
+      const mnx = max(nx_l, hasAlpha ? MAX_ALPHA_FREQ : MAX_CHROMA_FREQ),
+        mny = max(ny_l, hasAlpha ? MAX_ALPHA_FREQ : MAX_CHROMA_FREQ);
       // Pre‑compute cosine lookup tables for DCT.
       // The tables are regenerated only when image dimensions or alpha presence change,
       // avoiding unnecessary work across multiple encode calls.
@@ -313,7 +347,7 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
         endX = (w >> 1) + (w & 1);
       for (let cx = 0; cx < mnx; cx++) {
         const f = pw * cx;
-        for (let x = 0; x < endX; x++) fxTable[x * 7 + cx] = cos(f * (x + 0.5));
+        for (let x = 0; x < endX; x++) fxTable[x * MAX_L_FREQ + cx] = cos(f * (x + 0.5));
       }
       for (let cy = 0; cy < mny; cy++) {
         const o = cy * h,
@@ -335,7 +369,7 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
     const halfW = w >> 1,
       halfWEven = halfW & ~1,
       isOdd = w & 1;  // true when image width is odd (centre column has no symmetric partner)
-    this.encodeProfiler.record("tables");
+    if (__PROFILE__) this.encodeProfiler!.record("tables");
 
     // Optimization (4) – Channel Fission:
     // Rather than computing L, P, Q, and A all in one pass, we split into
@@ -361,7 +395,7 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
           srcL = y * w,
           srcR = y * w + w - 1,
           fxIdx = 0;
-        for (let x = 0; x < halfWEven; x += 2, srcL += 2, srcR -= 2, fxIdx += 14) {
+        for (let x = 0; x < halfWEven; x += 2, srcL += 2, srcR -= 2, fxIdx += 2 * MAX_L_FREQ) {
           const pL0 = rgba32[srcL],
             pR0 = rgba32[srcR],
             pL1 = rgba32[srcL + 1],
@@ -370,13 +404,13 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
             sR0 = (pR0 & 0xff) + ((pR0 >> 8) & 0xff) + ((pR0 >> 16) & 0xff);
           const sL1 = (pL1 & 0xff) + ((pL1 >> 8) & 0xff) + ((pL1 >> 16) & 0xff),
             sR1 = (pR1 & 0xff) + ((pR1 >> 8) & 0xff) + ((pR1 >> 16) & 0xff);
-          sl0 += (sL0 + sR0) * fxTable[fxIdx] + (sL1 + sR1) * fxTable[fxIdx + 7];
-          sl1 += (sL0 - sR0) * fxTable[fxIdx + 1] + (sL1 - sR1) * fxTable[fxIdx + 8];
-          sl2 += (sL0 + sR0) * fxTable[fxIdx + 2] + (sL1 + sR1) * fxTable[fxIdx + 9];
-          sl3 += (sL0 - sR0) * fxTable[fxIdx + 3] + (sL1 - sR1) * fxTable[fxIdx + 10];
-          sl4 += (sL0 + sR0) * fxTable[fxIdx + 4] + (sL1 + sR1) * fxTable[fxIdx + 11];
-          sl5 += (sL0 - sR0) * fxTable[fxIdx + 5] + (sL1 - sR1) * fxTable[fxIdx + 12];
-          sl6 += (sL0 + sR0) * fxTable[fxIdx + 6] + (sL1 + sR1) * fxTable[fxIdx + 13];
+          sl0 += (sL0 + sR0) * fxTable[fxIdx] + (sL1 + sR1) * fxTable[fxIdx + MAX_L_FREQ];
+          sl1 += (sL0 - sR0) * fxTable[fxIdx + 1] + (sL1 - sR1) * fxTable[fxIdx + MAX_L_FREQ + 1];
+          sl2 += (sL0 + sR0) * fxTable[fxIdx + 2] + (sL1 + sR1) * fxTable[fxIdx + MAX_L_FREQ + 2];
+          sl3 += (sL0 - sR0) * fxTable[fxIdx + 3] + (sL1 - sR1) * fxTable[fxIdx + MAX_L_FREQ + 3];
+          sl4 += (sL0 + sR0) * fxTable[fxIdx + 4] + (sL1 + sR1) * fxTable[fxIdx + MAX_L_FREQ + 4];
+          sl5 += (sL0 - sR0) * fxTable[fxIdx + 5] + (sL1 - sR1) * fxTable[fxIdx + MAX_L_FREQ + 5];
+          sl6 += (sL0 + sR0) * fxTable[fxIdx + 6] + (sL1 + sR1) * fxTable[fxIdx + MAX_L_FREQ + 6];
         }
         if (halfWEven < halfW) {
           const pL = rgba32[srcL],
@@ -392,7 +426,7 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
           sl6 += (sL + sR) * fxTable[fxIdx + 6];
           srcL++;
           srcR--;
-          fxIdx += 7;
+          fxIdx += MAX_L_FREQ;
         }
         if (isOdd) {
           const p = rgba32[srcL],
@@ -413,7 +447,7 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
         if (nx_l > 5) rowSumsL[5 * h + y] = sl5 * ENC_L_NORM;
         if (nx_l > 6) rowSumsL[6 * h + y] = sl6 * ENC_L_NORM;
       }
-      this.encodeProfiler.record("encodeHorizL");
+      if (__PROFILE__) this.encodeProfiler!.record("encodeHorizL");
       for (let y = 0; y < h; y++) {
         let sp0 = 0,
           sp1 = 0,
@@ -424,7 +458,7 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
           srcL = y * w,
           srcR = y * w + w - 1,
           fxIdx = 0;
-        for (let x = 0; x < halfWEven; x += 2, srcL += 2, srcR -= 2, fxIdx += 14) {
+        for (let x = 0; x < halfWEven; x += 2, srcL += 2, srcR -= 2, fxIdx += 2 * MAX_L_FREQ) {
           const pL0 = rgba32[srcL],
             pR0 = rgba32[srcR],
             pL1 = rgba32[srcL + 1],
@@ -449,12 +483,12 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
             QL1 = RL1 - GL1,
             PR1 = RR1 + GR1 - (BR1 << 1),
             QR1 = RR1 - GR1;
-          sp0 += (PL0 + PR0) * fxTable[fxIdx] + (PL1 + PR1) * fxTable[fxIdx + 7];
-          sp1 += (PL0 - PR0) * fxTable[fxIdx + 1] + (PL1 - PR1) * fxTable[fxIdx + 8];
-          sp2 += (PL0 + PR0) * fxTable[fxIdx + 2] + (PL1 + PR1) * fxTable[fxIdx + 9];
-          sq0 += (QL0 + QR0) * fxTable[fxIdx] + (QL1 + QR1) * fxTable[fxIdx + 7];
-          sq1 += (QL0 - QR0) * fxTable[fxIdx + 1] + (QL1 - QR1) * fxTable[fxIdx + 8];
-          sq2 += (QL0 + QR0) * fxTable[fxIdx + 2] + (QL1 + QR1) * fxTable[fxIdx + 9];
+          sp0 += (PL0 + PR0) * fxTable[fxIdx] + (PL1 + PR1) * fxTable[fxIdx + MAX_L_FREQ];
+          sp1 += (PL0 - PR0) * fxTable[fxIdx + 1] + (PL1 - PR1) * fxTable[fxIdx + MAX_L_FREQ + 1];
+          sp2 += (PL0 + PR0) * fxTable[fxIdx + 2] + (PL1 + PR1) * fxTable[fxIdx + MAX_L_FREQ + 2];
+          sq0 += (QL0 + QR0) * fxTable[fxIdx] + (QL1 + QR1) * fxTable[fxIdx + MAX_L_FREQ + 7];
+          sq1 += (QL0 - QR0) * fxTable[fxIdx + 1] + (QL1 - QR1) * fxTable[fxIdx + MAX_L_FREQ + 8];
+          sq2 += (QL0 + QR0) * fxTable[fxIdx + 2] + (QL1 + QR1) * fxTable[fxIdx + MAX_L_FREQ + 9];
         }
         if (halfWEven < halfW) {
           const pL = rgba32[srcL],
@@ -500,7 +534,7 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
         rowSumsQ[h + y] = sq1 * ENC_Q_NORM;
         rowSumsQ[2 * h + y] = sq2 * ENC_Q_NORM;
       }
-      this.encodeProfiler.record("encodeHorizPQ");
+      if (__PROFILE__) this.encodeProfiler!.record("encodeHorizPQ");
     }
 
     // Optimization (3) – Lazy LPQ Evaluation (vertical pass):
@@ -529,7 +563,7 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
       const iS = 0.5 / l_scale;
       for (let i = 0; i < l_ac.length; i++) l_ac[i] = 0.5 + l_ac[i] * iS;
     }
-    this.encodeProfiler.record("encodeVertL");
+    if (__PROFILE__) this.encodeProfiler!.record("encodeVertL");
 
     // Compute DC and AC components for the P and Q chroma channels.
     // Separate handling allows independent scaling based on perceptual importance.
@@ -539,9 +573,9 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
       q_scale = 0;
     const p_ac: number[] = [],
       q_ac: number[] = [];
-    for (let cy = 0; cy < 3; cy++) {
+    for (let cy = 0; cy < MAX_CHROMA_FREQ; cy++) {
       const fyo = cy * h;
-      for (let cx = 0; cx * 3 < 3 * (3 - cy); cx++) {
+      for (let cx = 0; cx * MAX_CHROMA_FREQ < MAX_CHROMA_FREQ * (MAX_CHROMA_FREQ - cy); cx++) {
         let fp = 0,
           fq = 0,
           rso = cx * h;
@@ -573,29 +607,29 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
       const iS = 0.5 / q_scale;
       for (let i = 0; i < q_ac.length; i++) q_ac[i] = 0.5 + q_ac[i] * iS;
     }
-    this.encodeProfiler.record("encodeVertPQ");
+    if (__PROFILE__) this.encodeProfiler!.record("encodeVertPQ");
 
     const isLandscape = w > h;
     // Pack the 24‑bit header: L‑DC, P‑DC, Q‑DC, L‑scale and alpha flag.
     // Bit positions are chosen to match the original ThumbHash specification.
     const h24 =
-      round(63 * l_dc) |
-      (round(31.5 + p_dc * 31.5) << 6) |
-      (round(31.5 + q_dc * 31.5) << 12) |
-      (round(31 * l_scale) << 18) |
-      ((hasAlpha ? 1 : 0) << 23);
+      round(L_DC_MAX * l_dc) |
+      (round(PQ_DC_CENTER + p_dc * PQ_DC_CENTER) << H24_P_DC) |
+      (round(PQ_DC_CENTER + q_dc * PQ_DC_CENTER) << H24_Q_DC) |
+      (round(L_SCALE_MAX * l_scale) << H24_L_SCALE) |
+      ((hasAlpha ? 1 : 0) << H24_HAS_ALPHA);
     const h16 =
       (isLandscape ? ny_l : nx_l) |
-      (round(63 * p_scale) << 3) |
-      (round(63 * q_scale) << 9) |
-      ((isLandscape ? 1 : 0) << 15);
+      (round(PQ_SCALE_MAX * p_scale) << H16_P_SCALE) |
+      (round(PQ_SCALE_MAX * q_scale) << H16_Q_SCALE) |
+      ((isLandscape ? 1 : 0) << H16_IS_LANDSCAPE);
     const hash = [h24 & 255, (h24 >> 8) & 255, h24 >> 16, h16 & 255, h16 >> 8];
     const ac_start = hasAlpha ? 6 : 5;
     let ac_idx = 0;
-    if (hasAlpha) hash.push(round((15 * avg_a) / numPixels) | (round(15 * 0) << 4));
+    if (hasAlpha) hash.push(round(ALPHA_MAX * avg_a / numPixels) | (round(ALPHA_MAX * 0) << 4));
     for (const ac of [l_ac, p_ac, q_ac])
-      for (const f of ac) hash[ac_start + (ac_idx >> 1)] |= round(15 * f) << ((ac_idx++ & 1) << 2);
-    this.encodeProfiler.record("packing");
+      for (const f of ac) hash[ac_start + (ac_idx >> 1)] |= round(ALPHA_MAX * f) << ((ac_idx++ & 1) << 2);
+    if (__PROFILE__) this.encodeProfiler!.record("packing");
     return new Uint8Array(hash);
   }
 
@@ -609,20 +643,20 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
    * and avoiding redundant calculations where possible.
    */
   thumbHashToRGBA(hash: Uint8Array): ThumbHashImage {
-    this.decodeProfiler.start();
+    if (__PROFILE__) this.decodeProfiler!.start();
     const h24 = hash[0] | (hash[1] << 8) | (hash[2] << 16),
       h16 = hash[3] | (hash[4] << 8);
-    const LB = (h24 & 63) * DEC_L_DC_PRESCALE,
-      PB = (((h24 >> 6) & 63) * DEC_PQ_DC_NORM - 1.0) * DEC_PQ_BASE_VAL,
-      QB = (((h24 >> 12) & 63) * DEC_PQ_DC_NORM - 1.0) * DEC_Q_BASE_VAL;
-    const lS = ((h24 >> 18) & 31) * DEC_L_AC_PRESCALE,
-      hasA = h24 >> 23,
-      pS = ((h16 >> 3) & 63) * DEC_P_AC_PRESCALE,
-      qS = ((h16 >> 9) & 63) * DEC_Q_AC_PRESCALE;
-    const isL = h16 >> 15,
-      lx = max(3, isL ? (hasA ? 5 : 7) : h16 & 7),
-      ly = max(3, isL ? h16 & 7 : hasA ? 5 : 7);
-    const AB = hasA ? (hash[5] & 15) * DEC_A_PRESCALE : 255.0,
+    const LB = (h24 & (L_DC_MAX | 0)) * DEC_L_DC_PRESCALE,
+      PB = (((h24 >> H24_P_DC) & (L_DC_MAX | 0)) * DEC_PQ_DC_NORM - 1.0) * DEC_PQ_BASE_VAL,
+      QB = (((h24 >> H24_Q_DC) & (L_DC_MAX | 0)) * DEC_PQ_DC_NORM - 1.0) * DEC_Q_BASE_VAL;
+    const lS = ((h24 >> H24_L_SCALE) & (L_SCALE_MAX | 0)) * DEC_L_AC_PRESCALE,
+      hasA = (h24 >> H24_HAS_ALPHA) & 1,
+      pS = ((h16 >> H16_P_SCALE) & (PQ_SCALE_MAX | 0)) * DEC_P_AC_PRESCALE,
+      qS = ((h16 >> H16_Q_SCALE) & (PQ_SCALE_MAX | 0)) * DEC_Q_AC_PRESCALE;
+    const isL = (h16 >> H16_IS_LANDSCAPE) & 1,
+      lx = max(3, isL ? (hasA ? MAX_ALPHA_FREQ : MAX_L_FREQ) : h16 & 7),
+      ly = max(3, isL ? h16 & 7 : hasA ? MAX_ALPHA_FREQ : MAX_L_FREQ);
+    const AB = hasA ? (hash[5] & (ALPHA_MAX | 0)) * DEC_A_PRESCALE : 255.0,
       aS = hasA ? (hash[5] >> 4) * DEC_A_PRESCALE : 0;
 
     let aci = 0,
@@ -630,30 +664,30 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
       acs = hasA ? 6 : 5;
     for (let cy = 0; cy < ly; cy++)
       for (let cx = cy ? 0 : 1; cx * ly < lx * (ly - cy); cx++)
-        dLAc[len++] = (((hash[acs + (aci >> 1)] >> ((aci++ & 1) << 2)) & 15) * DEC_AC_INPUT_NORM - 1.0) * lS;
+        dLAc[len++] = (((hash[acs + (aci >> 1)] >> ((aci++ & 1) << 2)) & (ALPHA_MAX | 0)) * DEC_AC_INPUT_NORM - 1.0) * lS;
     aci = 0;
     len = 0;
     for (let cy = 0; cy < 3; cy++)
       for (let cx = cy ? 0 : 1; cx < 3 - cy; cx++)
-        dPAc[len++] = (((hash[acs + (aci >> 1)] >> ((aci++ & 1) << 2)) & 15) * DEC_AC_INPUT_NORM - 1.0) * pS;
+        dPAc[len++] = (((hash[acs + (aci >> 1)] >> ((aci++ & 1) << 2)) & (ALPHA_MAX | 0)) * DEC_AC_INPUT_NORM - 1.0) * pS;
     aci = 0;
     len = 0;
     for (let cy = 0; cy < 3; cy++)
       for (let cx = cy ? 0 : 1; cx < 3 - cy; cx++)
-        dQAc[len++] = (((hash[acs + (aci >> 1)] >> ((aci++ & 1) << 2)) & 15) * DEC_AC_INPUT_NORM - 1.0) * qS;
+        dQAc[len++] = (((hash[acs + (aci >> 1)] >> ((aci++ & 1) << 2)) & (ALPHA_MAX | 0)) * DEC_AC_INPUT_NORM - 1.0) * qS;
 
-    this.decodeProfiler.record("header");
+    if (__PROFILE__) this.decodeProfiler!.record("header");
 
-    const w = round(lx / ly > 1 ? 32 : 32 * (lx / ly)),
-      h = round(lx / ly > 1 ? 32 / (lx / ly) : 32);
+    const w = round(lx / ly > 1 ? MAX_DECODE_DIM : MAX_DECODE_DIM * (lx / ly)),
+      h = round(lx / ly > 1 ? MAX_DECODE_DIM / (lx / ly) : MAX_DECODE_DIM);
     // Re‑generate IDCT tables only when output dimensions change.
     // This avoids costly cosine recomputation for repeated decodes of the same size.
     if (w !== lastDW || h !== lastDH || lx !== lastDLX || ly !== lastDLY) {
-      for (let cx = 0; cx < max(lx, 5); cx++) {
+      for (let cx = 0; cx < max(lx, MAX_CHROMA_FREQ + 2); cx++) {
         const f = (PI / w) * cx;
         for (let x = 0; x < w; x++) dFx[cx * w + x] = cos(f * (x + 0.5));
       }
-      for (let cy = 0; cy < max(ly, 5); cy++) {
+      for (let cy = 0; cy < max(ly, MAX_CHROMA_FREQ + 2); cy++) {
         const f = (PI / h) * cy;
         for (let y = 0; y < h; y++) dFy[cy * h + y] = cos(f * (y + 0.5)) * 2.0;
       }
@@ -663,7 +697,7 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
       lastDLY = ly;
     }
 
-    this.decodeProfiler.record("tables");
+    if (__PROFILE__) this.decodeProfiler!.record("tables");
 
     // Optimization (7) – Zero-Fill Elimination:
     // Instead of calling `tL.fill(0)` before this loop (which allocates no
@@ -683,10 +717,10 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
         } else for (let x = 0; x < w; x++) tL[to + x] += ac * dFx[fo + x];
       }
     }
-    for (let cy = 0, j = 0; cy < 3; cy++) {
+    for (let cy = 0, j = 0; cy < MAX_CHROMA_FREQ; cy++) {
       const to = cy * w;
       let first = true;
-      for (let cx = cy ? 0 : 1; cx < 3 - cy; cx++, j++) {
+      for (let cx = cy ? 0 : 1; cx < MAX_CHROMA_FREQ - cy; cx++, j++) {
         const ap = dPAc[j],
           aq = dQAc[j],
           fo = cx * w;
@@ -706,9 +740,9 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
       }
     }
 
-    this.decodeProfiler.record("idctHoriz");
+    if (__PROFILE__) this.decodeProfiler!.record("idctHoriz");
 
-    const rgba = new Uint8ClampedArray(w * h * 4);
+    const rgba = new Uint8ClampedArray(w * h * RGBA_CHANNELS);
     const halfH = h >> 1,
       isOH = h & 1,
       w1 = w,
@@ -730,14 +764,14 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
     // `it` and `ib` advance from the top and bottom rows simultaneously.
     // The even/odd decomposition (lE±lO, pE±pO, qE±qO) mirrors the horizontal
     // butterfly, again halving vertical cosine multiplications.
-    if (ly === 3) {
+    if (ly === MAX_CHROMA_FREQ) {
       for (let y = 0; y < halfH; y++) {
         const f0 = dFy[y],
           f1 = dFy[h + y],
           f2 = dFy[2 * h + y];
-        let it = y * w * 4,
-          ib = (h - 1 - y) * w * 4;
-        for (let x = 0; x < w; x++, it += 4, ib += 4) {
+        let it = y * w * RGBA_CHANNELS,
+          ib = (h - 1 - y) * w * RGBA_CHANNELS;
+        for (let x = 0; x < w; x++, it += RGBA_CHANNELS, ib += RGBA_CHANNELS) {
           const lE = LB + tL[x] * f0 + tL[w2 + x] * f2,
             lO = tL[w1 + x] * f1,
             pE = PB + tP[x] * f0 + tP[w2 + x] * f2,
@@ -760,16 +794,16 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
           rgba[ib + 3] = AB;
         }
       }
-    } else if (ly === 5) {
+    } else if (ly === MAX_ALPHA_FREQ) {
       for (let y = 0; y < halfH; y++) {
         const f0 = dFy[y],
           f1 = dFy[h + y],
           f2 = dFy[2 * h + y],
           f3 = dFy[3 * h + y],
           f4 = dFy[4 * h + y];
-        let it = y * w * 4,
-          ib = (h - 1 - y) * w * 4;
-        for (let x = 0; x < w; x++, it += 4, ib += 4) {
+        let it = y * w * RGBA_CHANNELS,
+          ib = (h - 1 - y) * w * RGBA_CHANNELS;
+        for (let x = 0; x < w; x++, it += RGBA_CHANNELS, ib += RGBA_CHANNELS) {
           const lE = LB + tL[x] * f0 + tL[w2 + x] * f2 + tL[w4 + x] * f4,
             lO = tL[w1 + x] * f1 + tL[w3 + x] * f3,
             pE = PB + tP[x] * f0 + tP[w2 + x] * f2,
@@ -801,9 +835,9 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
           f4 = dFy[4 * h + y],
           f5 = dFy[5 * h + y],
           f6 = dFy[6 * h + y];
-        let it = y * w * 4,
-          ib = (h - 1 - y) * w * 4;
-        for (let x = 0; x < w; x++, it += 4, ib += 4) {
+        let it = y * w * RGBA_CHANNELS,
+          ib = (h - 1 - y) * w * RGBA_CHANNELS;
+        for (let x = 0; x < w; x++, it += RGBA_CHANNELS, ib += RGBA_CHANNELS) {
           const lE = LB + tL[x] * f0 + tL[w2 + x] * f2 + tL[w4 + x] * f4 + tL[w6 + x] * f6,
             lO = tL[w1 + x] * f1 + tL[w3 + x] * f3 + tL[w5 + x] * f5,
             pE = PB + tP[x] * f0 + tP[w2 + x] * f2,
@@ -833,10 +867,10 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
         f2 = dFy[2 * h + y],
         f4 = dFy[4 * h + y],
         f6 = dFy[6 * h + y];
-      for (let x = 0, it = y * w * 4; x < w; x++, it += 4) {
+      for (let x = 0, it = y * w * RGBA_CHANNELS; x < w; x++, it += RGBA_CHANNELS) {
         let l = LB + tL[x] * f0;
-        if (ly === 3) l += tL[w2 + x] * f2;
-        else if (ly === 5) l += tL[w2 + x] * f2 + tL[w4 + x] * f4;
+        if (ly === MAX_CHROMA_FREQ) l += tL[w2 + x] * f2;
+        else if (ly === MAX_ALPHA_FREQ) l += tL[w2 + x] * f2 + tL[w4 + x] * f4;
         else l += tL[w2 + x] * f2 + tL[w4 + x] * f4 + tL[w6 + x] * f6;
         const p = PB + tP[x] * f0 + tP[w2 + x] * f2,
           q = QB + tQ[x] * f0 + tQ[w2 + x] * f2;
@@ -847,7 +881,7 @@ export class ThumbHashOptimized implements IThumbHashStrategy {
       }
     }
 
-    this.decodeProfiler.record("idctVert");
+    if (__PROFILE__) this.decodeProfiler!.record("idctVert");
     return { w, h, rgba: new Uint8Array(rgba.buffer) };
   }
 }
