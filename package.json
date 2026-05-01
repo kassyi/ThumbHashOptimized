@@ -1,5 +1,5 @@
 {
-  "name": "thumbhash",
+  "name": "thumbhash-optimized",
   "version": "1.0.0",
   "description": "ThumbHash Full-Stack Optimization Benchmark",
   "main": "src/index.js",
