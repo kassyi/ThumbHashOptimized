@@ -12,5 +12,5 @@ import { BenchUI } from "./bench-ui";
 // Wait for the DOM to be ready before instantiating BenchUI, because the
 // constructor immediately queries element IDs that must already exist.
 document.addEventListener("DOMContentLoaded", () => {
-  new BenchUI();
+    new BenchUI();
 });

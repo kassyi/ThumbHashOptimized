@@ -1,0 +1,26 @@
+
+> thumbhash-optimized@1.0.0 prebuild
+> npm run generate
+
+
+> thumbhash-optimized@1.0.0 generate
+> npx tsx scripts/generate-thumbhash.ts
+
+✅ Successfully generated: C:\Users\tonbo\Documents\bms-kyokufu-blogger\packages\thumbhash-optimized\src\generated\thumbhash-optimized.ts
+
+> thumbhash-optimized@1.0.0 build
+> webpack --mode production
+
+app:
+  asset [1m[32mthumbhash-optimized-benchmark.js[39m[22m 26.9 KiB [1m[33m[compared for emit][39m[22m [1m[32m[minimized][39m[22m (name: main)
+  asset [1m[32mindex.html[39m[22m 9.14 KiB [1m[32m[emitted][39m[22m
+  orphan modules 94 KiB [1m[33m[orphan][39m[22m 4 modules
+  [1m./src/index.ts + 4 modules[39m[22m 94.5 KiB [1m[33m[built][39m[22m [1m[33m[code generated][39m[22m
+  [1mapp[39m[22m (webpack 5.106.2) compiled [1m[32msuccessfully[39m[22m in 6014 ms
+
+lib:
+  asset [1m[32mthumbhash-optimized.js[39m[22m 15 KiB [1m[33m[compared for emit][39m[22m [javascript module] [1m[32m[minimized][39m[22m (name: main)
+  runtime modules 396 bytes 2 modules
+  orphan modules 2.56 KiB [1m[33m[orphan][39m[22m 1 module
+  [1m./src/generated/thumbhash-optimized.ts[39m[22m 63.5 KiB [1m[33m[built][39m[22m [1m[33m[code generated][39m[22m
+  [1mlib[39m[22m (webpack 5.106.2) compiled [1m[32msuccessfully[39m[22m in 4606 ms

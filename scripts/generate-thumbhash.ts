@@ -11,65 +11,90 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Define the absolute paths
-const templatePath = path.resolve(__dirname, "../src/templates/thumbhash-optimized.ts.ejs");
-const outputPath = path.resolve(__dirname, "../src/generated/thumbhash-optimized.ts");
+const templatePath = path.resolve(
+    __dirname,
+    "../src/templates/thumbhash-optimized.ts.ejs",
+);
+const outputPath = path.resolve(
+    __dirname,
+    "../src/generated/thumbhash-optimized.ts",
+);
 
 // Standard algorithm parameters used during generation to unfold loops
 const params = {
-  MAX_L_FREQ: 7,
-  MAX_CHROMA_FREQ: 3,
-  MAX_ALPHA_FREQ: 5,
-  MAX_DECODE_DIM: 32,
-  MAX_IMG_DIM: 100,
-  RGBA_CHANNELS: 4,
-  L_DC_MAX: 63.0,
-  PQ_DC_CENTER: 31.5,
-  L_SCALE_MAX: 31.0,
-  PQ_SCALE_MAX: 63.0,
-  ALPHA_MAX: 15.0,
-  AC_INPUT_NORM: 1.0 / 7.5,
-  H24: {
-    L_DC: 0,
-    P_DC: 6,
-    Q_DC: 12,
-    L_SCALE: 18,
-    HAS_ALPHA: 23,
-  },
-  H16: {
-    FREQ_COUNT: 0,
-    P_SCALE: 3,
-    Q_SCALE: 9,
-    IS_LANDSCAPE: 15,
-  }
+    MAX_L_FREQ: 7,
+    MAX_CHROMA_FREQ: 3,
+    MAX_ALPHA_FREQ: 5,
+    MAX_DECODE_DIM: 32,
+    MAX_IMG_DIM: 100,
+    RGBA_CHANNELS: 4,
+    L_DC_MAX: 63.0,
+    PQ_DC_CENTER: 31.5,
+    L_SCALE_MAX: 31.0,
+    PQ_SCALE_MAX: 63.0,
+    ALPHA_MAX: 15.0,
+    AC_INPUT_NORM: 1.0 / 7.5,
+    H24: {
+        L_DC: 0,
+        P_DC: 6,
+        Q_DC: 12,
+        L_SCALE: 18,
+        HAS_ALPHA: 23,
+    },
+    H16: {
+        FREQ_COUNT: 0,
+        P_SCALE: 3,
+        Q_SCALE: 9,
+        IS_LANDSCAPE: 15,
+    },
 };
 
 async function generate() {
-  try {
-    const templateContent = fs.readFileSync(templatePath, "utf8");
+    try {
+        const templateContent = fs.readFileSync(templatePath, "utf8");
 
-    // Augment params with generated strings
-    const renderParams = {
-      ...params,
-      L_DCT_HORIZONTAL_BLOCK: EncodeHorizGenerator.generateL(4, params.MAX_L_FREQ),
-      PQ_DCT_HORIZONTAL_BLOCK: EncodeHorizGenerator.generatePQ(4, params.MAX_CHROMA_FREQ, params.MAX_L_FREQ),
-      PQ_DCT_VERTICAL_BLOCK: EncodeVertGenerator.generatePQ(params.MAX_CHROMA_FREQ),
-      DECODE_IDCT_HORIZ_L_BLOCK: DecodeHorizGenerator.generateL(params.MAX_L_FREQ),
-      DECODE_IDCT_HORIZ_PQ_BLOCK: DecodeHorizGenerator.generatePQ(params.MAX_CHROMA_FREQ),
-      DECODE_IDCT_VERT_BLOCK: DecodeVertGenerator.generateIDCTVert(params.MAX_L_FREQ, params.MAX_CHROMA_FREQ),
-      DECODE_IDCT_VERT_ODD_BLOCK: DecodeVertGenerator.generateIDCTVertOdd(params.MAX_L_FREQ, params.MAX_CHROMA_FREQ),
-    };
+        // Augment params with generated strings
+        const renderParams = {
+            ...params,
+            L_DCT_HORIZONTAL_BLOCK: EncodeHorizGenerator.generateL(
+                4,
+                params.MAX_L_FREQ,
+            ),
+            PQ_DCT_HORIZONTAL_BLOCK: EncodeHorizGenerator.generatePQ(
+                4,
+                params.MAX_CHROMA_FREQ,
+                params.MAX_L_FREQ,
+            ),
+            PQ_DCT_VERTICAL_BLOCK: EncodeVertGenerator.generatePQ(
+                params.MAX_CHROMA_FREQ,
+            ),
+            DECODE_IDCT_HORIZ_L_BLOCK: DecodeHorizGenerator.generateL(
+                params.MAX_L_FREQ,
+            ),
+            DECODE_IDCT_HORIZ_PQ_BLOCK: DecodeHorizGenerator.generatePQ(
+                params.MAX_CHROMA_FREQ,
+            ),
+            DECODE_IDCT_VERT_BLOCK: DecodeVertGenerator.generateIDCTVert(
+                params.MAX_L_FREQ,
+                params.MAX_CHROMA_FREQ,
+            ),
+            DECODE_IDCT_VERT_ODD_BLOCK: DecodeVertGenerator.generateIDCTVertOdd(
+                params.MAX_L_FREQ,
+                params.MAX_CHROMA_FREQ,
+            ),
+        };
 
-    // Render the EJS template using the parameters
-    const outputContent = ejs.render(templateContent, renderParams);
+        // Render the EJS template using the parameters
+        const outputContent = ejs.render(templateContent, renderParams);
 
-    // Ensure the output directory exists
-    const outputDir = path.dirname(outputPath);
-    if (!fs.existsSync(outputDir)) {
-      fs.mkdirSync(outputDir, { recursive: true });
-    }
+        // Ensure the output directory exists
+        const outputDir = path.dirname(outputPath);
+        if (!fs.existsSync(outputDir)) {
+            fs.mkdirSync(outputDir, { recursive: true });
+        }
 
-    // Add an auto-generated warning at the top
-    const banner = `/**
+        // Add an auto-generated warning at the top
+        const banner = `/**
  * ==============================================================================
  * ⚠️ WARNING: AUTO-GENERATED FILE ⚠️
  * ==============================================================================
@@ -78,12 +103,12 @@ async function generate() {
  * ==============================================================================
  */\n`;
 
-    fs.writeFileSync(outputPath, banner + outputContent, "utf8");
-    console.log(`✅ Successfully generated: ${outputPath}`);
-  } catch (error) {
-    console.error("❌ Failed to generate thumbhash-optimized.ts:", error);
-    process.exit(1);
-  }
+        fs.writeFileSync(outputPath, banner + outputContent, "utf8");
+        console.log(`✅ Successfully generated: ${outputPath}`);
+    } catch (error) {
+        console.error("❌ Failed to generate thumbhash-optimized.ts:", error);
+        process.exit(1);
+    }
 }
 
 generate();
