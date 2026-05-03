@@ -5,6 +5,7 @@
         "moduleResolution": "bundler",
         "rootDir": "./src",
         "strict": true,
+        "declaration": true,
         "esModuleInterop": true,
         "skipLibCheck": true,
         "forceConsistentCasingInFileNames": true,

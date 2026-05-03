@@ -1,13 +1,17 @@
 {
     "name": "thumbhash-optimized",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "ThumbHash Full-Stack Optimization Benchmark",
-    "main": "src/index.js",
+    "main": "dist/thumbhash-optimized.js",
+    "types": "dist/generated/thumbhash-optimized.d.ts",
     "type": "module",
+    "files": [
+        "dist"
+    ],
     "scripts": {
         "generate": "npx tsx scripts/generate-thumbhash.ts",
         "prebuild": "npm run generate",
-        "build": "webpack --mode production",
+        "build": "webpack --mode production && tsc --emitDeclarationOnly",
         "dev": "webpack serve --mode development",
         "test": "echo \"Error: no test specified\" && exit 1"
     },
